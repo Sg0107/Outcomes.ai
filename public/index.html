@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Outcomes API tester</title>
+  <style>
+    :root {
+      --bg: #f3f0e8;
+      --card: #fffcf7;
+      --ink: #1c1917;
+      --muted: #57534e;
+      --line: #e7e0d4;
+      --accent: #0f5c4c;
+      --accent-ink: #f7f4ee;
+      --ok: #166534;
+      --warn: #92400e;
+      --bad: #991b1b;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+    }
+
+    header {
+      padding: 28px 32px 8px;
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    header h1 {
+      margin: 0;
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    header p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-family: system-ui, sans-serif;
+      font-size: 14px;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 16px 32px 48px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+      gap: 20px;
+      align-items: start;
+    }
+
+    .stack { display: grid; gap: 16px; }
+
+    section, .log {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 18px 18px 16px;
+    }
+
+    h2 {
+      margin: 0 0 4px;
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .hint {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .hint code, .path {
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    form { display: grid; gap: 10px; }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    label {
+      display: grid;
+      gap: 4px;
+      font-family: system-ui, sans-serif;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    input, textarea, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+
+    textarea { min-height: 88px; resize: vertical; }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-top: 4px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      cursor: pointer;
+      background: var(--accent);
+      color: var(--accent-ink);
+    }
+
+    button.ghost {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+
+    button:disabled { opacity: 0.55; cursor: wait; }
+
+    .log {
+      position: sticky;
+      top: 16px;
+      max-height: calc(100vh - 32px);
+      display: flex;
+      flex-direction: column;
+      min-height: 420px;
+    }
+
+    .log-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
+    #entries {
+      overflow: auto;
+      display: grid;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .entry {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: #fff;
+    }
+
+    .entry header {
+      padding: 0;
+      margin: 0 0 8px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .status { font-weight: 700; }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .status.bad { color: var(--bad); }
+
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .empty {
+      color: var(--muted);
+      font-family: system-ui, sans-serif;
+      font-size: 13px;
+      margin: 12px 0 0;
+    }
+
+    @media (max-width: 860px) {
+      header, main { padding-left: 16px; padding-right: 16px; }
+      main { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+      .log { position: static; max-height: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Outcomes API tester</h1>
+    <p>Send encounter events and read summaries against this server.</p>
+  </header>
+
+  <main>
+    <div class="stack">
+      <section>
+        <h2>Ingest event</h2>
+        <p class="hint"><span class="path">POST /v1/encounters/events</span>. Version 1 can omit encounter id. Later versions need the existing encounter id. Payload is sent as <code>{ transcription }</code>.</p>
+        <form id="ingest-form">
+          <div class="row">
+            <label>Event id
+              <input id="eventId" name="eventId" required />
+            </label>
+            <label>Patient id
+              <input id="patientId" name="patientId" value="pat-33" required />
+            </label>
+          </div>
+          <div class="row">
+            <label>Encounter id
+              <input id="encounterId" name="encounterId" value="enc-201" placeholder="Required when version is not 1" />
+            </label>
+            <label>Encounter type
+              <input id="encounterType" name="encounterType" value="Appointment" required />
+            </label>
+          </div>
+          <label>Version
+            <input id="version" name="version" type="number" min="1" value="1" required />
+          </label>
+          <label>Transcription
+            <textarea id="transcription" name="transcription" required>Nurse: Good morning. Patient reports a mild headache for three days, no fever, and is taking fluids.</textarea>
+          </label>
+          <div class="actions">
+            <button type="submit" id="send-btn">Send event</button>
+            <button type="button" class="ghost" id="new-event">New event id</button>
+          </div>
+        </form>
+      </section>
+
+      <section>
+        <h2>Summary</h2>
+        <p class="hint"><span class="path">GET /v1/encounters/:encounterId/summary</span></p>
+        <form id="summary-form">
+          <label>Encounter id
+            <input id="summaryEncounterId" value="enc-201" required />
+          </label>
+          <div class="actions">
+            <button type="submit">Get summary</button>
+          </div>
+        </form>
+      </section>
+
+      <section>
+        <h2>Summary history</h2>
+        <p class="hint"><span class="path">GET /v1/encounters/:patientId/summary-history</span></p>
+        <form id="history-form">
+          <label>Patient id
+            <input id="historyPatientId" value="pat-33" required />
+          </label>
+          <div class="actions">
+            <button type="submit">Get history</button>
+            <button type="button" class="ghost" id="health-btn">Health check</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <aside class="log">
+      <div class="log-head">
+        <h2>Responses</h2>
+        <button type="button" class="ghost" id="clear-log">Clear</button>
+      </div>
+      <p class="empty" id="empty">Nothing sent yet.</p>
+      <div id="entries"></div>
+    </aside>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const entries = $("entries");
+    const empty = $("empty");
+
+    function newEventId() {
+      const stamp = Date.now().toString(36);
+      const rand = Math.random().toString(36).slice(2, 6);
+      return `evt-${stamp}-${rand}`;
+    }
+
+    $("eventId").value = newEventId();
+    $("new-event").addEventListener("click", () => {
+      $("eventId").value = newEventId();
+    });
+
+    function statusClass(code) {
+      if (code >= 200 && code < 300) return "ok";
+      if (code >= 400 && code < 500) return "warn";
+      return "bad";
+    }
+
+    function log(method, path, status, body) {
+      empty.hidden = true;
+      const article = document.createElement("article");
+      article.className = "entry";
+      const time = new Date().toLocaleTimeString();
+      const pretty = typeof body === "string" ? body : JSON.stringify(body, null, 2);
+      article.innerHTML = `
+        <header>
+          <span>${method} ${path}</span>
+          <span class="status ${statusClass(status)}">${status} · ${time}</span>
+        </header>
+        <pre></pre>
+      `;
+      article.querySelector("pre").textContent = pretty;
+      entries.prepend(article);
+    }
+
+    async function callApi(method, path, body) {
+      const options = { method, headers: {} };
+      if (body !== undefined) {
+        options.headers["Content-Type"] = "application/json";
+        options.body = JSON.stringify(body);
+      }
+      const response = await fetch(path, options);
+      const text = await response.text();
+      let parsed = text;
+      try { parsed = text ? JSON.parse(text) : null; } catch (_) { /* keep text */ }
+      log(method, path, response.status, parsed);
+      return { status: response.status, body: parsed };
+    }
+
+    $("ingest-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const encounterId = $("encounterId").value.trim();
+      const patientId = $("patientId").value.trim();
+      const version = Number($("version").value);
+      const payload = {
+        eventId: $("eventId").value.trim(),
+        patientId,
+        version,
+        encounterType: $("encounterType").value.trim(),
+        payload: { transcription: $("transcription").value }
+      };
+      if (encounterId) payload.encounterId = encounterId;
+
+      $("send-btn").disabled = true;
+      try {
+        await callApi("POST", "/v1/encounters/events", payload);
+        if (encounterId) {
+          $("summaryEncounterId").value = encounterId;
+        }
+        $("historyPatientId").value = patientId;
+      } catch (err) {
+        log("POST", "/v1/encounters/events", 0, String(err));
+      } finally {
+        $("send-btn").disabled = false;
+        $("eventId").value = newEventId();
+      }
+    });
+
+    $("summary-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const id = $("summaryEncounterId").value.trim();
+      await callApi("GET", `/v1/encounters/${encodeURIComponent(id)}/summary`);
+    });
+
+    $("history-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const id = $("historyPatientId").value.trim();
+      await callApi("GET", `/v1/encounters/${encodeURIComponent(id)}/summary-history`);
+    });
+
+    $("health-btn").addEventListener("click", () => callApi("GET", "/health"));
+    $("clear-log").addEventListener("click", () => {
+      entries.replaceChildren();
+      empty.hidden = false;
+    });
+  </script>
+</body>
+</html>
