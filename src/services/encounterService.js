@@ -6,7 +6,23 @@ const mongoose = require('mongoose');
  */
 const processEncounter = async (eventData) => {
   const { eventId, patientId, version, encounterType, payload, encounterId } = eventData;
-  console.log("Processing encounter:", { eventId, patientId, version, encounterType, payload, encounterId });
+  if (!eventId) {
+    return { status: 400, code: 'BAD_REQUEST', message: 'Event ID is required' };
+  }
+  if (!patientId) {
+      return { status: 400, code: 'BAD_REQUEST', message: 'Patient ID is required' };
+  }
+  if (!version) {
+      return { status: 400, code: 'BAD_REQUEST', message: 'Version is required' };
+  }
+  if (!encounterType) {
+      return { status: 400, code: 'BAD_REQUEST', message: 'Encounter type is required' };
+  }
+  if (!payload) {
+      return { status: 400, code: 'BAD_REQUEST', message: 'Payload is required' };
+  }
+  console.log("Data received:", eventData);
+
   // 1. Check for duplicate event (Idempotency)
   const existingEvent = await Encounter.findOne({ eventId: eventId });
   if (existingEvent) {
