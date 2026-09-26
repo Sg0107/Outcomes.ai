@@ -147,7 +147,7 @@ const getSummaryHistory = async (patientId, encounterType, encounterId) => {
 const generateSummaryText = async (payload, encounterId, version, patientId, encounterType) => {
   try {
       // set timeout here for a random number between 5-15sec, and if time exceeds 10 sec we will throw error
-      let timeout = Math.floor(Math.random() * 10000);
+      let timeout = Math.floor(Math.random() * 10000) + 5000;
       console.log("Timeout:", timeout);
       if (timeout > 10000) {
           timeout = 10000;
