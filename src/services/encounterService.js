@@ -41,9 +41,10 @@ const processEncounter = async (eventData) => {
     }
   } else {
     console.log("Creating new encounter");
+    const generatedEncounterId = new mongoose.Types.ObjectId().toString();
     encounter = new Encounter({
       eventId,
-      encounterId : new mongoose.Types.ObjectId(),
+      encounterId: generatedEncounterId,
       patientId,
       encounterType,
       version: version,
@@ -57,8 +58,8 @@ const processEncounter = async (eventData) => {
       }
     });
     await encounter.save();
-    generateSummaryText(payload, encounter.encounterId, version, patientId, encounterType);
-    return { status: 201, code: 'ACCEPTED', message: 'Encounter event accepted for processing', data: { encounterId, version: version } };
+    generateSummaryText(payload, generatedEncounterId, version, patientId, encounterType);
+    return { status: 201, code: 'ACCEPTED', message: 'Encounter event accepted for processing', data: { encounterId: generatedEncounterId, version: version } };
   }
 
   console.log("checking patient id consistency and stale version");
@@ -66,6 +67,13 @@ const processEncounter = async (eventData) => {
     // Validate Patient ID consistency
     if (encounter.patientId !== patientId) {
       const error = new Error('Patient ID mismatch for existing Encounter ID');
+      error.status = 422;
+      throw error;
+    }
+
+    // Encounter type is fixed for the life of the encounter, same as patientId
+    if (encounter.encounterType !== encounterType) {
+      const error = new Error('Encounter type mismatch for existing Encounter ID');
       error.status = 422;
       throw error;
     }
@@ -82,7 +90,7 @@ const processEncounter = async (eventData) => {
   // 4. Update Encounter and mark older older encounter as SUPERSEDED
   await Encounter.updateOne({ encounterId: encounter.encounterId }, { $set: { 'latestSummaryData.status' : 'SUPERSEDED', 'latestSummaryData.errorMessage' : 'Newer version of the encounter has been received' } });
 
-  generateSummaryText(payload, encounterId, version, patientId, encounterType);
+  generateSummaryText(payload, encounter.encounterId, version, patientId, encounter.encounterType);
 
   return {
     status: 201,
@@ -107,10 +115,13 @@ const getEncounterSummary = async (encounterId) => {
         console.log("Latest summary data:", encounter.latestSummaryData);
         return encounter.latestSummaryData;
     } catch (error) {
-        error = new Error('Error getting encounter summary');
-        error.status = 500;
-        throw error;
-}
+        if (error.status === 404) {
+            throw error;
+        }
+        const wrapped = new Error('Error getting encounter summary');
+        wrapped.status = 500;
+        throw wrapped;
+    }
 };
 
 /**
