@@ -9,7 +9,9 @@ const summaryJobSchema = new mongoose.Schema({
   summaryText: { type: String, default: null },
   errorMessage: { type: String, default: null },
   queuedAt: { type: Date, default: Date.now },
-  completedAt: { type: Date }
+  completedAt: { type: Date },
+  slaBreached: { type: Boolean, default: false },
+  slaBreachedAt: { type: Date, default: null }
 }, { _id: false });
 
 const encounterSchema = new mongoose.Schema(

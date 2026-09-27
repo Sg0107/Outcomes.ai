@@ -50,8 +50,9 @@ The handler returns `201` before the summary is ready. Poll the summary route.
 | Outcome | HTTP | `code` | What happens |
 | --- | --- | --- | --- |
 | New visit (`encounterId` omitted) | 201 | `ACCEPTED` | A document is created with a generated `encounterId`, the transcription, and a `PENDING` summary. Summary generation starts immediately. |
-| Newer version of an existing visit | 201 | `ACCEPTED` | `version` and `transcription` move forward. The previous summary is marked `SUPERSEDED`. A new summary run starts for the new version. |
-| Same `eventId` as one already stored on a visit | 200 | `DUPLICATE` | Nothing is written. |
+| Newer version of an existing visit | 201 | `ACCEPTED` | `version` and `transcription` move forward. `latestSummaryData` resets to `PENDING`. A new summary run starts for the new version. |
+| Same `eventId` as a previously accepted event | 200 | `DUPLICATE` | Nothing is written. |
+| Same `(encounterId, version)` under a different `eventId` | 200 | `DUPLICATE` | Nothing is written. |
 | `encounterId` that does not exist | 404 | `NOT_FOUND` | Nothing is written. |
 | `version` less than or equal to the stored version | 200 | `STALE_IGNORED` | Nothing is written. The visit does not move backward. |
 | Same `encounterId`, different `patientId` | 422 | — | Request is rejected. Visit state is unchanged. |
@@ -59,7 +60,7 @@ The handler returns `201` before the summary is ready. Poll the summary route.
 
 `201` and `200` bodies look like `{ "status", "code", "message", "data": { "encounterId", "version" } }`. `data` is only present on `ACCEPTED`. On a brand-new visit, `data.encounterId` is the id the server generated for that visit.
 
-Follow-up events do not replace the stored `eventId`. The duplicate check only matches the `eventId` saved when the visit was created.
+Every accepted event is recorded in `ProcessedEvent` with a unique `eventId` and a unique `(encounterId, version)` pair. Retries of the same `eventId`, or a second event for the same version under a different `eventId`, return `DUPLICATE`.
 
 `encounterType` is required, and it is stored on create. A later event for the same `encounterId` must send that same type. A different type is rejected with `422`, the same way a different `patientId` is.
 
@@ -67,17 +68,17 @@ Follow-up events do not replace the stored `eventId`. The duplicate check only m
 
 `GET /v1/encounters/:encounterId/summary`
 
-On success, returns `{ "data": { "status", "summaryText", "errorMessage", "queuedAt", "completedAt" } }`.
+On success, returns `{ "data": { "status", "summaryText", "errorMessage", "queuedAt", "completedAt", "slaBreached", "slaBreachedAt" } }`.
 
 Generation picks a delay from 5 seconds up to just under 15 seconds. The run is not awaited by the ingest handler, and it is not resumed after a process restart. A visit left in `PENDING` stays there.
 
-If the delay is over 10 seconds, the run waits 10 seconds, sets `status` to `FAILED` with `errorMessage` `Timeout generating summary text`, and stops. That update matches `encounterId` and this run’s `version`, so a newer version already stored on the visit is left alone. A history row is inserted for the same `encounterId` and `version`, with `summaryText` null and that same `errorMessage`. The run is not retried.
+If the simulated delay exceeds 10 seconds, the run waits 10 seconds, sets `slaBreached` to `true`, records the timeout in history, and retries up to 3 times with backoff (2s, 4s, 8s). The visit stays `PENDING` during retries. After all retries are exhausted, `status` becomes `FAILED`. Updates always match `encounterId` and this run’s `version`, so a newer version already stored on the visit is left alone.
 
 Otherwise the run waits the full delay, then builds `summaryText` as `Summary text of the payload whose length is <n>` and reads the visit’s stored `version`.
 
 | Stored version | What is written |
 | --- | --- |
-| Newer than this run | The text is saved to summary history only. `latestSummaryData.status` becomes `SUPERSEDED` and `errorMessage` becomes `Newer version of the encounter has been received`. `summaryText` on the visit is not replaced. |
+| Newer than this run | The text is saved to summary history only. `latestSummaryData` on the visit is not touched — the newer version keeps its current status. |
 | Still this run’s version | `summaryText`, `status` `COMPLETED`, and `completedAt` are written on the visit, and a history row is inserted. |
 
 The status enum is `PENDING`, `COMPLETED`, `FAILED`, `SUPERSEDED`. A successful run writes `COMPLETED`. A timeout writes `FAILED`.
@@ -86,9 +87,9 @@ If the visit does not exist, the route returns `404` with `{ "error": { "message
 
 ## Summary history
 
-`GET /v1/encounters/:patientId/summary-history`
+`GET /v1/encounters/:patientId/summary-history?encounterType=...&encounterId=...`
 
-Returns every stored summary for that patient:
+Returns stored summaries for that patient. Optional query params `encounterType` and `encounterId` narrow the results.
 
 ```json
 {
@@ -108,13 +109,15 @@ Returns every stored summary for that patient:
 
 A timed-out version is included in that list with `summaryText` null and `errorMessage` `Timeout generating summary text`.
 
-No rows returns HTTP `200` with `code` `NOT_FOUND`. The route only reads `patientId`. `encounterType` and `encounterId` are not applied as filters.
+No rows returns HTTP `404` with `code` `NOT_FOUND`.
 
 ## Data stored
 
-`Encounter` — one document per visit. Fields: `eventId`, `encounterId`, `patientId`, `encounterType`, `version`, `transcription`, and embedded `latestSummaryData` (`status`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`). Unique index on `(encounterId, version)`. Versions are updated in place, so the collection keeps the latest version only.
+`Encounter` — one document per visit. Fields: `eventId`, `encounterId`, `patientId`, `encounterType`, `version`, `transcription`, and embedded `latestSummaryData` (`status`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`, `slaBreached`, `slaBreachedAt`). Versions are updated in place, so the collection keeps the latest version only.
 
-`SummaryHistory` — one document per summary run, including a timeout. Fields: `patientId`, `encounterType`, `encounterId`, `version`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`. `summaryText` is null when the run times out. Unique index on `(encounterId, version)`.
+`ProcessedEvent` — one document per accepted event. Fields: `eventId`, `encounterId`, `version`, `patientId`, `encounterType`. Unique index on `eventId` and on `(encounterId, version)`.
+
+`SummaryHistory` — one document per summary run, including a timeout. Fields: `patientId`, `encounterType`, `encounterId`, `version`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`, `retryCount`. `summaryText` is null when the run times out. Unique index on `(encounterId, version)`.
 
 ## Layout
 
@@ -127,6 +130,7 @@ src/routes/encounterRoutes.js      ingest, summary, summary history
 src/controllers/encounterController.js
 src/services/encounterService.js   idempotency, stale check, patient mismatch, summary generation
 src/models/Encounter.js
+src/models/ProcessedEvent.js
 src/models/summaryHistory.js
 public/index.html                  local page for exercising the API
 ```
@@ -136,10 +140,11 @@ Errors thrown from the service go through the handler in `src/app.js` and return
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.
-- Retries after a timeout, and pickup of `PENDING` jobs after a process restart. A timeout already marks the visit `FAILED` and writes a history row, but the run is not retried.
-- Duplicate detection for event ids received after the first version.
-- History filters for encounter type and encounter id.
-- Tests for duplicate, stale, out-of-order, concurrent, and crash/retry cases.
+- Pickup of `PENDING` jobs after a process restart (Phase 2).
+- Persistent `SummaryJob` queue and background worker (Phase 2).
+- SLA breach as operational signal separate from failure (Phase 2).
+- Tests for duplicate, stale, out-of-order, concurrent, and crash/retry cases (Phase 3).
+- Design submission document (Phase 4).
 
 ## Credits
 

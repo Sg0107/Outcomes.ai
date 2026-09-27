@@ -22,9 +22,10 @@ const getSummary = async (req, res, next) => {
 
 const getSummaryHistory = async (req, res, next) => {
   try {
-    const { patientId, encounterType, encounterId} = req.params;
+    const { patientId } = req.params;
+    const { encounterType, encounterId } = req.query;
     const summaryHistory = await encounterService.getSummaryHistory(patientId, encounterType, encounterId);
-    return res.status(200).json(summaryHistory);
+    return res.status(summaryHistory.status).json(summaryHistory);
   } catch (err) {
     next(err);
   }

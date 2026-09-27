@@ -1,6 +1,124 @@
 const Encounter = require('../models/Encounter');
+const ProcessedEvent = require('../models/ProcessedEvent');
 const SummaryHistory = require('../models/summaryHistory');
 const mongoose = require('mongoose');
+const { MAX_RETRIES, SLA_MS, RETRY_BACKOFF_MS } = require('../helper/constants');
+
+const buildPendingSummaryData = () => ({
+  status: 'PENDING',
+  summaryText: null,
+  errorMessage: null,
+  queuedAt: new Date(),
+  completedAt: null,
+  slaBreached: false,
+  slaBreachedAt: null,
+});
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const recordProcessedEvent = async ({ eventId, encounterId, version, patientId, encounterType }) => {
+  try {
+    await ProcessedEvent.create({ eventId, encounterId, version, patientId, encounterType });
+    return { duplicate: false };
+  } catch (err) {
+    if (err.code === 11000) {
+      return { duplicate: true };
+    }
+    throw err;
+  }
+};
+
+const getEncounterVersion = async (encounterId) => {
+  const encounter = await Encounter.findOne({ encounterId }).select('version').lean();
+  return encounter?.version ?? null;
+};
+
+const isStaleJob = async (encounterId, version) => {
+  const currentVersion = await getEncounterVersion(encounterId);
+  return currentVersion === null || currentVersion > version;
+};
+
+const upsertSummaryHistory = async ({
+  encounterId,
+  version,
+  patientId,
+  encounterType,
+  summaryText,
+  errorMessage,
+  retryCount,
+}) => {
+  await SummaryHistory.updateOne(
+    { encounterId, version },
+    {
+      $set: {
+        patientId,
+        encounterType,
+        summaryText,
+        errorMessage,
+        retryCount,
+        completedAt: new Date(),
+      },
+      $setOnInsert: { queuedAt: new Date() },
+    },
+    { upsert: true }
+  );
+};
+
+const markSummaryCompleted = async (encounterId, version, summaryText) => {
+  await Encounter.updateOne(
+    { encounterId, version },
+    {
+      $set: {
+        'latestSummaryData.summaryText': summaryText,
+        'latestSummaryData.status': 'COMPLETED',
+        'latestSummaryData.errorMessage': null,
+        'latestSummaryData.completedAt': new Date(),
+      },
+    }
+  );
+};
+
+const markSummaryFailed = async (encounterId, version, errorMessage) => {
+  await Encounter.updateOne(
+    { encounterId, version },
+    {
+      $set: {
+        'latestSummaryData.status': 'FAILED',
+        'latestSummaryData.errorMessage': errorMessage,
+      },
+    }
+  );
+};
+
+const markSlaBreached = async (encounterId, version) => {
+  await Encounter.updateOne(
+    { encounterId, version, 'latestSummaryData.slaBreached': { $ne: true } },
+    {
+      $set: {
+        'latestSummaryData.slaBreached': true,
+        'latestSummaryData.slaBreachedAt': new Date(),
+      },
+    }
+  );
+};
+
+const sleepWithSlaTracking = async (encounterId, version, durationMs) => {
+  const slaTimer =
+    durationMs >= SLA_MS
+      ? setTimeout(async () => {
+          if (!(await isStaleJob(encounterId, version))) {
+            await markSlaBreached(encounterId, version);
+          }
+        }, SLA_MS)
+      : null;
+
+  await sleep(durationMs);
+
+  if (slaTimer) {
+    clearTimeout(slaTimer);
+  }
+};
+
 /**
  * Process incoming encounter event with versioning and idempotency checks.
  */
@@ -10,93 +128,108 @@ const processEncounter = async (eventData) => {
     return { status: 400, code: 'BAD_REQUEST', message: 'Event ID is required' };
   }
   if (!patientId) {
-      return { status: 400, code: 'BAD_REQUEST', message: 'Patient ID is required' };
+    return { status: 400, code: 'BAD_REQUEST', message: 'Patient ID is required' };
   }
   if (!version) {
-      return { status: 400, code: 'BAD_REQUEST', message: 'Version is required' };
+    return { status: 400, code: 'BAD_REQUEST', message: 'Version is required' };
   }
   if (!encounterType) {
-      return { status: 400, code: 'BAD_REQUEST', message: 'Encounter type is required' };
+    return { status: 400, code: 'BAD_REQUEST', message: 'Encounter type is required' };
   }
   if (!payload) {
-      return { status: 400, code: 'BAD_REQUEST', message: 'Payload is required' };
+    return { status: 400, code: 'BAD_REQUEST', message: 'Payload is required' };
   }
-  console.log("Data received:", eventData);
 
-  // 1. Check for duplicate event (Idempotency)
-  const existingEvent = await Encounter.findOne({ eventId: eventId });
+  const existingEvent = await ProcessedEvent.findOne({ eventId }).lean();
   if (existingEvent) {
     return { status: 200, code: 'DUPLICATE', message: 'Duplicate event ignored' };
   }
-  console.log("Existing event not found");
 
-  // 2. Retrieve existing encounter
-  let encounter
   if (encounterId) {
-    console.log("Checking for existing encounter:", { encounterId });
-    encounter = await Encounter.findOne({ encounterId });
-    console.log("Encounter found:", encounter);
+    const encounter = await Encounter.findOne({ encounterId });
     if (!encounter) {
       return { status: 404, code: 'NOT_FOUND', message: 'Encounter not found' };
     }
-  } else {
-    console.log("Creating new encounter");
-    const generatedEncounterId = new mongoose.Types.ObjectId().toString();
-    encounter = new Encounter({
-      eventId,
-      encounterId: generatedEncounterId,
-      patientId,
-      encounterType,
-      version: version,
-      transcription: payload.transcription,
-      latestSummaryData: {
-        status: 'PENDING',
-        summaryText: null,
-        errorMessage: null,
-        queuedAt: Date.now(),
-        completedAt: null
-      }
-    });
-    await encounter.save();
-    generateSummaryText(payload, generatedEncounterId, version, patientId, encounterType);
-    return { status: 201, code: 'ACCEPTED', message: 'Encounter event accepted for processing', data: { encounterId: generatedEncounterId, version: version } };
-  }
 
-  console.log("checking patient id consistency and stale version");
-  if (encounter) {
-    // Validate Patient ID consistency
     if (encounter.patientId !== patientId) {
       const error = new Error('Patient ID mismatch for existing Encounter ID');
       error.status = 422;
       throw error;
     }
 
-    // Encounter type is fixed for the life of the encounter, same as patientId
     if (encounter.encounterType !== encounterType) {
       const error = new Error('Encounter type mismatch for existing Encounter ID');
       error.status = 422;
       throw error;
     }
 
-    // Check for stale event
     if (version <= encounter.version) {
       return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
     }
+
+    const processed = await recordProcessedEvent({
+      eventId,
+      encounterId,
+      version,
+      patientId,
+      encounterType,
+    });
+    if (processed.duplicate) {
+      return { status: 200, code: 'DUPLICATE', message: 'Duplicate event ignored' };
+    }
+
+    await Encounter.updateOne(
+      { encounterId },
+      {
+        $set: {
+          version,
+          transcription: payload.transcription,
+          latestSummaryData: buildPendingSummaryData(),
+        },
+      }
+    );
+
+    generateSummaryText(payload, encounterId, version, patientId, encounterType);
+
+    return {
+      status: 201,
+      code: 'ACCEPTED',
+      message: 'Encounter event accepted for processing',
+      data: { encounterId, version },
+    };
   }
-  console.log("creating new encounter", { eventId, encounterId, patientId, version, encounterType, transcription : payload.transcription });
-  // 3. update existing encounter
-  await Encounter.updateOne({ encounterId: encounter.encounterId }, { $set: { 'version' : version, 'transcription' : payload.transcription } });
 
-  // 4. Update Encounter and mark older older encounter as SUPERSEDED
-  await Encounter.updateOne({ encounterId: encounter.encounterId }, { $set: { 'latestSummaryData.status' : 'SUPERSEDED', 'latestSummaryData.errorMessage' : 'Newer version of the encounter has been received' } });
+  const generatedEncounterId = new mongoose.Types.ObjectId().toString();
 
-  generateSummaryText(payload, encounter.encounterId, version, patientId, encounter.encounterType);
+  const processed = await recordProcessedEvent({
+    eventId,
+    encounterId: generatedEncounterId,
+    version,
+    patientId,
+    encounterType,
+  });
+  if (processed.duplicate) {
+    return { status: 200, code: 'DUPLICATE', message: 'Duplicate event ignored' };
+  }
+
+  const encounter = new Encounter({
+    eventId,
+    encounterId: generatedEncounterId,
+    patientId,
+    encounterType,
+    version,
+    transcription: payload.transcription,
+    latestSummaryData: buildPendingSummaryData(),
+  });
+  await encounter.save();
+
+  generateSummaryText(payload, generatedEncounterId, version, patientId, encounterType);
 
   return {
     status: 201,
     code: 'ACCEPTED',
     message: 'Encounter event accepted for processing',
-    data: { encounterId, version: version }
+    data: { encounterId: generatedEncounterId, version },
   };
 };
 
@@ -104,109 +237,118 @@ const processEncounter = async (eventData) => {
  * Retrieve latest summary status for an encounter
  */
 const getEncounterSummary = async (encounterId) => {
-    try {
-        const encounter = await Encounter.findOne({ encounterId: encounterId }).select('latestSummaryData').lean();
-        if (!encounter) {
-            const error = new Error('Encounter not found');
-            error.status = 404;
-            throw error;
-        }
-        console.log("Encounter found:", encounter);
-        console.log("Latest summary data:", encounter.latestSummaryData);
-        return encounter.latestSummaryData;
-    } catch (error) {
-        if (error.status === 404) {
-            throw error;
-        }
-        const wrapped = new Error('Error getting encounter summary');
-        wrapped.status = 500;
-        throw wrapped;
-    }
+  const encounter = await Encounter.findOne({ encounterId }).select('latestSummaryData').lean();
+  if (!encounter) {
+    const error = new Error('Encounter not found');
+    error.status = 404;
+    throw error;
+  }
+  return encounter.latestSummaryData;
 };
 
 /**
- * Get summary history for a patient and encounter type
+ * Get summary history for a patient, optionally filtered by encounter type or encounter id
  */
 const getSummaryHistory = async (patientId, encounterType, encounterId) => {
-    try {
-      const query = {patientId: patientId};
-      if (encounterType) query.encounterType = encounterType;
-      if (encounterId) query.encounterId = encounterId;
-      const summaryHistory = await SummaryHistory.find(query);
-      if (summaryHistory.length === 0) {
-        return { status: 404, code: 'NOT_FOUND', message: 'Summary history not found' };
-      }
-      const summaryHistoryData = summaryHistory.map((item) => {
-        return {
-          encounterId: item.encounterId,
-          version: item.version,
-          summaryText: item.summaryText,
-          errorMessage: item.errorMessage
-        }
-      });
-      return { status: 200, code: 'SUCCESS', message: 'Summary history fetched successfully', data: summaryHistoryData };
-    } catch (error) {
-        error.message = 'Error getting summary history';
-        error.status = 500;
-        return { status: 500, code: 'ERROR', message: 'Error getting summary history', data: null };
-    }
-}
+  const query = { patientId };
+  if (encounterType) query.encounterType = encounterType;
+  if (encounterId) query.encounterId = encounterId;
+
+  const summaryHistory = await SummaryHistory.find(query);
+  if (summaryHistory.length === 0) {
+    return { status: 404, code: 'NOT_FOUND', message: 'Summary history not found' };
+  }
+
+  const summaryHistoryData = summaryHistory.map((item) => ({
+    encounterId: item.encounterId,
+    version: item.version,
+    summaryText: item.summaryText,
+    errorMessage: item.errorMessage,
+  }));
+
+  return {
+    status: 200,
+    code: 'SUCCESS',
+    message: 'Summary history fetched successfully',
+    data: summaryHistoryData,
+  };
+};
 
 /**
  * Generate summary text from payload
  */
-const generateSummaryText = async (payload, encounterId, version, patientId, encounterType, retrycount = 0) => {
+const generateSummaryText = async (payload, encounterId, version, patientId, encounterType, retryCount = 0) => {
   try {
-      // set timeout here for a random number between 5-15sec, and if time exceeds 10 sec we will throw error
-      let timeout = Math.floor(Math.random() * 10000) + 5000;
-      console.log("Timeout:", timeout);
-      if (timeout > 10000) {
-          timeout = 10000;
-          await new Promise(resolve => setTimeout(resolve, timeout));
-          await Encounter.updateOne({ encounterId: encounterId, version: version }, 
-            { $set: { 'latestSummaryData.status' : 'FAILED', 'latestSummaryData.errorMessage' : 'Timeout generating summary text' } });
-          if (retrycount === 0) {
-            await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: null, errorMessage: 'Timeout generating summary text', patientId: patientId, encounterType: encounterType, retryCount: retrycount });
-          } else {
-            await SummaryHistory.updateOne({ encounterId: encounterId, version: version }, { $set: { summaryText: null, errorMessage: 'Timeout generating summary text', retryCount: retrycount } });
-          }
-          if (retrycount >= 3) {
-            throw new Error('Timeout generating summary text');
-          }
-          console.log("Retrying to generate summary text", retrycount + 1);
-          return generateSummaryText(payload, encounterId, version, patientId, encounterType, retrycount + 1);
+    if (await isStaleJob(encounterId, version)) {
+      return;
+    }
+
+    let timeout = Math.floor(Math.random() * 10000) + 5000;
+    const simulatedTimeout = timeout > SLA_MS;
+
+    if (simulatedTimeout) {
+      timeout = SLA_MS;
+    }
+
+    await sleepWithSlaTracking(encounterId, version, timeout);
+
+    if (await isStaleJob(encounterId, version)) {
+      return;
+    }
+
+    if (simulatedTimeout) {
+      const errorMessage = 'Timeout generating summary text';
+      await upsertSummaryHistory({
+        encounterId,
+        version,
+        patientId,
+        encounterType,
+        summaryText: null,
+        errorMessage,
+        retryCount,
+      });
+
+      if (retryCount >= MAX_RETRIES) {
+        await markSummaryFailed(encounterId, version, errorMessage);
+        return;
       }
-      console.log("Starting summary text generation", retrycount);
-      await new Promise(resolve => setTimeout(resolve, timeout));
-      console.log("Summary text generation completed", retrycount);
-      const summaryText = `Summary text of the payload whose length is ${payload?.transcription?.length}`;
-      // using unqiue index on encounterId and version to update the summary text and status
-      // do not update if version of existing encounter is greater than the version of the new encounter but still save in sumary history and mark as superseded
-      const existingEncounter = await Encounter.findOne({ encounterId: encounterId }).select('version').lean();
-      if (existingEncounter.version < version) {
-        if (retrycount === 0) {
-          await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType, retryCount: retrycount });
-        }else {
-          await SummaryHistory.updateOne({ encounterId: encounterId, version: version }, { $set: { 'summaryText' : summaryText, 'errorMessage' : null, 'retryCount' : retrycount } });
-        }
-        await Encounter.updateOne({ encounterId: encounterId }, { $set: { 'latestSummaryData.status' : 'SUPERSEDED', 'latestSummaryData.errorMessage' : 'Newer version of the encounter has been received' } });
-        return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
-      }
-      await Encounter.updateOne({ encounterId: encounterId, version: version }, 
-          { $set: { 'latestSummaryData.summaryText' : summaryText, 'latestSummaryData.status' : 'COMPLETED', 'latestSummaryData.errorMessage' : null, 'latestSummaryData.completedAt' : Date.now() } });
-      if (retrycount === 0) {
-        await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType, retryCount: retrycount });
-      } else {
-        await SummaryHistory.updateOne({ encounterId: encounterId, version: version }, { $set: { summaryText: summaryText, errorMessage: null, retryCount: retrycount } });
-      }
+
+      await sleep(RETRY_BACKOFF_MS[retryCount] ?? 8000);
+      return generateSummaryText(payload, encounterId, version, patientId, encounterType, retryCount + 1);
+    }
+
+    const summaryText = `Summary text of the payload whose length is ${payload?.transcription?.length}`;
+
+    if (await isStaleJob(encounterId, version)) {
+      await upsertSummaryHistory({
+        encounterId,
+        version,
+        patientId,
+        encounterType,
+        summaryText,
+        errorMessage: null,
+        retryCount,
+      });
+      return;
+    }
+
+    await markSummaryCompleted(encounterId, version, summaryText);
+    await upsertSummaryHistory({
+      encounterId,
+      version,
+      patientId,
+      encounterType,
+      summaryText,
+      errorMessage: null,
+      retryCount,
+    });
   } catch (error) {
-      console.error('Error generating summary text:', error);
-      return { status: 500, code: 'ERROR', message: error.message || 'Error generating summary text', data: null };
+    console.error('Error generating summary text:', error);
   }
-}
+};
 
 module.exports = {
   processEncounter,
   getEncounterSummary,
-  getSummaryHistory
+  getSummaryHistory,
 };
