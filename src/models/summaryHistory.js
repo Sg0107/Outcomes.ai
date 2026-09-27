@@ -5,7 +5,7 @@ const summaryHistorySchema = new mongoose.Schema({
     encounterType: { type: String, required: true },
     encounterId: { type: String, required: true },
     version: { type: Number, required: true },
-    summaryText: { type: String, required: true },
+    summaryText: { type: String, default: null },
     errorMessage: { type: String, default: null },
     queuedAt: { type: Date, default: Date.now },
     completedAt: { type: Date }

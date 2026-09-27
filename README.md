@@ -55,12 +55,13 @@ The handler returns `201` before the summary is ready. Poll the summary route.
 | `encounterId` that does not exist | 404 | `NOT_FOUND` | Nothing is written. |
 | `version` less than or equal to the stored version | 200 | `STALE_IGNORED` | Nothing is written. The visit does not move backward. |
 | Same `encounterId`, different `patientId` | 422 | — | Request is rejected. Visit state is unchanged. |
+| Same `encounterId`, different `encounterType` | 422 | — | Request is rejected. Visit state is unchanged. |
 
-`201` and `200` bodies look like `{ "status", "code", "message", "data": { "encounterId", "version" } }`. `data` is only present on `ACCEPTED`. On a brand-new visit, `data.encounterId` echoes the request field, which was omitted, so the generated id is only in MongoDB.
+`201` and `200` bodies look like `{ "status", "code", "message", "data": { "encounterId", "version" } }`. `data` is only present on `ACCEPTED`. On a brand-new visit, `data.encounterId` is the id the server generated for that visit.
 
 Follow-up events do not replace the stored `eventId`. The duplicate check only matches the `eventId` saved when the visit was created.
 
-`encounterType` is required, and it is stored on create. A later event with a different type is not rejected and does not change the stored type.
+`encounterType` is required, and it is stored on create. A later event for the same `encounterId` must send that same type. A different type is rejected with `422`, the same way a different `patientId` is.
 
 ## Summary
 
@@ -79,9 +80,9 @@ Otherwise the run waits the full delay, then builds `summaryText` as `Summary te
 | Newer than this run | The text is saved to summary history only. `latestSummaryData.status` becomes `SUPERSEDED` and `errorMessage` becomes `Newer version of the encounter has been received`. `summaryText` on the visit is not replaced. |
 | Still this run’s version | `summaryText`, `status` `COMPLETED`, and `completedAt` are written on the visit, and a history row is inserted. |
 
-The schema enum is `PENDING`, `PROCESSING`, `READY`, `FAILED`, `SUPERSEDED`. A successful run writes `COMPLETED`, which is outside that enum. Updates do not run validators, so the value is stored. Nothing in the current path sets `PROCESSING` or `READY`.
+The schema enum is `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`, `SUPERSEDED`. A successful run writes `COMPLETED`. Nothing in the current path sets `PROCESSING`.
 
-If the visit does not exist, the service throws 404 and the controller catch turns that into `500` with `{ "error": { "message": "Error getting encounter summary" } }`.
+If the visit does not exist, the route returns `404` with `{ "error": { "message": "Encounter not found" } }`.
 
 ## Summary history
 
@@ -133,12 +134,8 @@ Errors thrown from the service go through the handler in `src/app.js` and return
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.
-- Returning the generated `encounterId` when the client omits it.
-- Treating `encounterType` as fixed for an `encounterId`, the way `patientId` already is.
 - A durable worker: timeouts that can fail, retries, and pickup of `PENDING` jobs after a crash.
 - Duplicate detection for event ids received after the first version.
-- Summary status aligned with the schema (`READY` or `FAILED` instead of `COMPLETED`).
-- `404` from the summary route for an unknown visit, instead of `500`.
 - History filters for encounter type and encounter id.
 - Tests for duplicate, stale, out-of-order, concurrent, and crash/retry cases.
 

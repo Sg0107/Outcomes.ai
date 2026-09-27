@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const summaryJobSchema = new mongoose.Schema({
   status: {
     type: String,
-    enum: ['PENDING', 'PROCESSING', 'READY', 'FAILED', 'SUPERSEDED'],
+    enum: ['PENDING', 'COMPLETED', 'FAILED', 'SUPERSEDED'],
     default: 'PENDING'
   },
   summaryText: { type: String, default: null },
