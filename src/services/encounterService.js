@@ -165,6 +165,7 @@ const generateSummaryText = async (payload, encounterId, version, patientId, enc
           await new Promise(resolve => setTimeout(resolve, timeout));
           await Encounter.updateOne({ encounterId: encounterId, version: version }, 
             { $set: { 'latestSummaryData.status' : 'FAILED', 'latestSummaryData.errorMessage' : 'Timeout generating summary text' } });
+          await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: null, errorMessage: 'Timeout generating summary text', patientId: patientId, encounterType: encounterType });
           throw new Error('Timeout generating summary text');
       }
       console.log("Waiting for timeout:", timeout);
