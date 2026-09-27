@@ -162,6 +162,13 @@ const generateSummaryText = async (payload, encounterId, version, patientId, enc
       const summaryText = `Summary text of the payload whose length is ${payload?.transcription?.length}`;
       // using unqiue index on encounterId and version to update the summary text and status
       console.log("Updating encounter", { encounterId, version, summaryText, status: 'COMPLETED', completedAt: Date.now() });
+      // do not update if version of existing encounter is greater than the version of the new encounter but still save in sumary history and mark as superseded
+      const existingEncounter = await Encounter.findOne({ encounterId: encounterId }).select('version').lean();
+      if (existingEncounter.version > version) {
+        await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType });
+        await Encounter.updateOne({ encounterId: encounterId }, { $set: { 'latestSummaryData.status' : 'SUPERSEDED', 'latestSummaryData.errorMessage' : 'Newer version of the encounter has been received' } });
+        return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
+      }
       await Encounter.updateOne({ encounterId: encounterId, version: version }, 
           { $set: { 'latestSummaryData.summaryText' : summaryText, 'latestSummaryData.status' : 'COMPLETED', 'latestSummaryData.completedAt' : Date.now() } });
       await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType });
