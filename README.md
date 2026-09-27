@@ -68,17 +68,18 @@ Follow-up events do not replace the stored `eventId`. The duplicate check only m
 
 On success, returns `{ "data": { "status", "summaryText", "errorMessage", "queuedAt", "completedAt" } }`.
 
-Generation waits a random delay under 10 seconds, then writes:
+Generation picks a delay from 5 seconds up to just under 15 seconds. The run is not awaited by the ingest handler, and it is not resumed after a process restart. A visit left in `PENDING` stays there.
 
-- `summaryText`: `Summary text of the payload whose length is <n>`
-- `status`: `COMPLETED`
-- `completedAt`: timestamp
+If the delay is over 10 seconds, the run waits 10 seconds, sets `status` to `FAILED` with `errorMessage` `Timeout generating summary text`, and stops. That update matches `encounterId` and this run’s `version`, so a newer version already stored on the visit is left alone. No history row is written.
 
-A finished run is also inserted into summary history. The run is not awaited by the ingest handler, and it is not resumed after a process restart. A visit left in `PENDING` stays there.
+Otherwise the run waits the full delay, then builds `summaryText` as `Summary text of the payload whose length is <n>` and reads the visit’s stored `version`.
 
-The schema enum is `PENDING`, `PROCESSING`, `READY`, `FAILED`, `SUPERSEDED`. The generator writes `COMPLETED`, which is outside that enum. Updates do not run validators, so the value is stored. Nothing in the current path sets `PROCESSING` or `READY`. The branch that would mark a run `FAILED` after 10 seconds never runs, because the delay is always shorter than that.
+| Stored version | What is written |
+| --- | --- |
+| Newer than this run | The text is saved to summary history only. `latestSummaryData.status` becomes `SUPERSEDED` and `errorMessage` becomes `Newer version of the encounter has been received`. `summaryText` on the visit is not replaced. |
+| Still this run’s version | `summaryText`, `status` `COMPLETED`, and `completedAt` are written on the visit, and a history row is inserted. |
 
-A newer version updates the visit’s `version` before its own run starts. An in-flight run for the older version updates by `encounterId` and that older `version`, so it does not overwrite the newer summary. It can still insert a history row when its delay ends.
+The schema enum is `PENDING`, `PROCESSING`, `READY`, `FAILED`, `SUPERSEDED`. A successful run writes `COMPLETED`, which is outside that enum. Updates do not run validators, so the value is stored. Nothing in the current path sets `PROCESSING` or `READY`.
 
 If the visit does not exist, the service throws 404 and the controller catch turns that into `500` with `{ "error": { "message": "Error getting encounter summary" } }`.
 
