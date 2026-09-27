@@ -71,7 +71,7 @@ On success, returns `{ "data": { "status", "summaryText", "errorMessage", "queue
 
 Generation picks a delay from 5 seconds up to just under 15 seconds. The run is not awaited by the ingest handler, and it is not resumed after a process restart. A visit left in `PENDING` stays there.
 
-If the delay is over 10 seconds, the run waits 10 seconds, sets `status` to `FAILED` with `errorMessage` `Timeout generating summary text`, and stops. That update matches `encounterId` and this run’s `version`, so a newer version already stored on the visit is left alone. No history row is written.
+If the delay is over 10 seconds, the run waits 10 seconds, sets `status` to `FAILED` with `errorMessage` `Timeout generating summary text`, and stops. That update matches `encounterId` and this run’s `version`, so a newer version already stored on the visit is left alone. A history row is inserted for the same `encounterId` and `version`, with `summaryText` null and that same `errorMessage`. The run is not retried.
 
 Otherwise the run waits the full delay, then builds `summaryText` as `Summary text of the payload whose length is <n>` and reads the visit’s stored `version`.
 
@@ -80,7 +80,7 @@ Otherwise the run waits the full delay, then builds `summaryText` as `Summary te
 | Newer than this run | The text is saved to summary history only. `latestSummaryData.status` becomes `SUPERSEDED` and `errorMessage` becomes `Newer version of the encounter has been received`. `summaryText` on the visit is not replaced. |
 | Still this run’s version | `summaryText`, `status` `COMPLETED`, and `completedAt` are written on the visit, and a history row is inserted. |
 
-The schema enum is `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`, `SUPERSEDED`. A successful run writes `COMPLETED`. Nothing in the current path sets `PROCESSING`.
+The status enum is `PENDING`, `COMPLETED`, `FAILED`, `SUPERSEDED`. A successful run writes `COMPLETED`. A timeout writes `FAILED`.
 
 If the visit does not exist, the route returns `404` with `{ "error": { "message": "Encounter not found" } }`.
 
@@ -106,13 +106,15 @@ Returns every stored summary for that patient:
 }
 ```
 
+A timed-out version is included in that list with `summaryText` null and `errorMessage` `Timeout generating summary text`.
+
 No rows returns HTTP `200` with `code` `NOT_FOUND`. The route only reads `patientId`. `encounterType` and `encounterId` are not applied as filters.
 
 ## Data stored
 
 `Encounter` — one document per visit. Fields: `eventId`, `encounterId`, `patientId`, `encounterType`, `version`, `transcription`, and embedded `latestSummaryData` (`status`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`). Unique index on `(encounterId, version)`. Versions are updated in place, so the collection keeps the latest version only.
 
-`SummaryHistory` — one document per completed summary run. Fields: `patientId`, `encounterType`, `encounterId`, `version`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`. Unique index on `(encounterId, version)`.
+`SummaryHistory` — one document per summary run, including a timeout. Fields: `patientId`, `encounterType`, `encounterId`, `version`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`. `summaryText` is null when the run times out. Unique index on `(encounterId, version)`.
 
 ## Layout
 
@@ -134,7 +136,7 @@ Errors thrown from the service go through the handler in `src/app.js` and return
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.
-- A durable worker: timeouts that can fail, retries, and pickup of `PENDING` jobs after a crash.
+- Retries after a timeout, and pickup of `PENDING` jobs after a process restart. A timeout already marks the visit `FAILED` and writes a history row, but the run is not retried.
 - Duplicate detection for event ids received after the first version.
 - History filters for encounter type and encounter id.
 - Tests for duplicate, stale, out-of-order, concurrent, and crash/retry cases.
