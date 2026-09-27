@@ -155,7 +155,7 @@ const getSummaryHistory = async (patientId, encounterType, encounterId) => {
 /**
  * Generate summary text from payload
  */
-const generateSummaryText = async (payload, encounterId, version, patientId, encounterType) => {
+const generateSummaryText = async (payload, encounterId, version, patientId, encounterType, retrycount = 0) => {
   try {
       // set timeout here for a random number between 5-15sec, and if time exceeds 10 sec we will throw error
       let timeout = Math.floor(Math.random() * 10000) + 5000;
@@ -165,25 +165,40 @@ const generateSummaryText = async (payload, encounterId, version, patientId, enc
           await new Promise(resolve => setTimeout(resolve, timeout));
           await Encounter.updateOne({ encounterId: encounterId, version: version }, 
             { $set: { 'latestSummaryData.status' : 'FAILED', 'latestSummaryData.errorMessage' : 'Timeout generating summary text' } });
-          await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: null, errorMessage: 'Timeout generating summary text', patientId: patientId, encounterType: encounterType });
-          throw new Error('Timeout generating summary text');
+          if (retrycount === 0) {
+            await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: null, errorMessage: 'Timeout generating summary text', patientId: patientId, encounterType: encounterType, retryCount: retrycount });
+          } else {
+            await SummaryHistory.updateOne({ encounterId: encounterId, version: version }, { $set: { summaryText: null, errorMessage: 'Timeout generating summary text', retryCount: retrycount } });
+          }
+          if (retrycount >= 3) {
+            throw new Error('Timeout generating summary text');
+          }
+          console.log("Retrying to generate summary text", retrycount + 1);
+          return generateSummaryText(payload, encounterId, version, patientId, encounterType, retrycount + 1);
       }
-      console.log("Waiting for timeout:", timeout);
+      console.log("Starting summary text generation", retrycount);
       await new Promise(resolve => setTimeout(resolve, timeout));
-      console.log("Timeout completed");
+      console.log("Summary text generation completed", retrycount);
       const summaryText = `Summary text of the payload whose length is ${payload?.transcription?.length}`;
       // using unqiue index on encounterId and version to update the summary text and status
-      console.log("Updating encounter", { encounterId, version, summaryText, status: 'COMPLETED', completedAt: Date.now() });
       // do not update if version of existing encounter is greater than the version of the new encounter but still save in sumary history and mark as superseded
       const existingEncounter = await Encounter.findOne({ encounterId: encounterId }).select('version').lean();
-      if (existingEncounter.version > version) {
-        await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType });
+      if (existingEncounter.version < version) {
+        if (retrycount === 0) {
+          await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType, retryCount: retrycount });
+        }else {
+          await SummaryHistory.updateOne({ encounterId: encounterId, version: version }, { $set: { 'summaryText' : summaryText, 'errorMessage' : null, 'retryCount' : retrycount } });
+        }
         await Encounter.updateOne({ encounterId: encounterId }, { $set: { 'latestSummaryData.status' : 'SUPERSEDED', 'latestSummaryData.errorMessage' : 'Newer version of the encounter has been received' } });
         return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
       }
       await Encounter.updateOne({ encounterId: encounterId, version: version }, 
-          { $set: { 'latestSummaryData.summaryText' : summaryText, 'latestSummaryData.status' : 'COMPLETED', 'latestSummaryData.completedAt' : Date.now() } });
-      await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType });
+          { $set: { 'latestSummaryData.summaryText' : summaryText, 'latestSummaryData.status' : 'COMPLETED', 'latestSummaryData.errorMessage' : null, 'latestSummaryData.completedAt' : Date.now() } });
+      if (retrycount === 0) {
+        await SummaryHistory.create({ encounterId: encounterId, version: version, summaryText: summaryText, errorMessage: null, patientId: patientId, encounterType: encounterType, retryCount: retrycount });
+      } else {
+        await SummaryHistory.updateOne({ encounterId: encounterId, version: version }, { $set: { summaryText: summaryText, errorMessage: null, retryCount: retrycount } });
+      }
   } catch (error) {
       console.error('Error generating summary text:', error);
       return { status: 500, code: 'ERROR', message: error.message || 'Error generating summary text', data: null };

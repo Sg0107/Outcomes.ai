@@ -8,7 +8,8 @@ const summaryHistorySchema = new mongoose.Schema({
     summaryText: { type: String, default: null },
     errorMessage: { type: String, default: null },
     queuedAt: { type: Date, default: Date.now },
-    completedAt: { type: Date }
+    completedAt: { type: Date },
+    retryCount: { type: Number, default: 0 }
 });
 
 // create unique index on encounterId and version
