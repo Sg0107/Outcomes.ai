@@ -2,7 +2,7 @@ const Encounter = require('../models/Encounter');
 const ProcessedEvent = require('../models/ProcessedEvent');
 const SummaryHistory = require('../models/summaryHistory');
 const mongoose = require('mongoose');
-const { MAX_RETRIES, SLA_MS, RETRY_BACKOFF_MS } = require('../helper/constants');
+const { createSummaryJob } = require('./summaryWorkerService');
 
 const buildPendingSummaryData = () => ({
   status: 'PENDING',
@@ -14,108 +14,77 @@ const buildPendingSummaryData = () => ({
   slaBreachedAt: null,
 });
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const recordProcessedEvent = async ({ eventId, encounterId, version, patientId, encounterType }) => {
-  try {
-    await ProcessedEvent.create({ eventId, encounterId, version, patientId, encounterType });
-    return { duplicate: false };
-  } catch (err) {
-    if (err.code === 11000) {
-      return { duplicate: true };
-    }
-    throw err;
-  }
-};
-
-const getEncounterVersion = async (encounterId) => {
-  const encounter = await Encounter.findOne({ encounterId }).select('version').lean();
-  return encounter?.version ?? null;
-};
-
-const isStaleJob = async (encounterId, version) => {
-  const currentVersion = await getEncounterVersion(encounterId);
-  return currentVersion === null || currentVersion > version;
-};
-
-const upsertSummaryHistory = async ({
+/**
+ * Atomically record ProcessedEvent, update/create Encounter, and queue SummaryJob.
+ */
+const commitAcceptedEvent = async ({
+  eventId,
   encounterId,
   version,
   patientId,
   encounterType,
-  summaryText,
-  errorMessage,
-  retryCount,
+  transcription,
+  isNewEncounter,
 }) => {
-  await SummaryHistory.updateOne(
-    { encounterId, version },
-    {
-      $set: {
-        patientId,
-        encounterType,
-        summaryText,
-        errorMessage,
-        retryCount,
-        completedAt: new Date(),
-      },
-      $setOnInsert: { queuedAt: new Date() },
-    },
-    { upsert: true }
-  );
-};
+  const session = await mongoose.startSession();
 
-const markSummaryCompleted = async (encounterId, version, summaryText) => {
-  await Encounter.updateOne(
-    { encounterId, version },
-    {
-      $set: {
-        'latestSummaryData.summaryText': summaryText,
-        'latestSummaryData.status': 'COMPLETED',
-        'latestSummaryData.errorMessage': null,
-        'latestSummaryData.completedAt': new Date(),
-      },
+  try {
+    session.startTransaction();
+
+    await ProcessedEvent.create(
+      [{ eventId, encounterId, version, patientId, encounterType }],
+      { session }
+    );
+
+    if (isNewEncounter) {
+      await Encounter.create(
+        [
+          {
+            eventId,
+            encounterId,
+            patientId,
+            encounterType,
+            version,
+            transcription,
+            latestSummaryData: buildPendingSummaryData(),
+          },
+        ],
+        { session }
+      );
+    } else {
+      const updateResult = await Encounter.updateOne(
+        { encounterId, version: { $lt: version } },
+        {
+          $set: {
+            version,
+            transcription,
+            latestSummaryData: buildPendingSummaryData(),
+          },
+        },
+        { session }
+      );
+
+      if (updateResult.modifiedCount === 0) {
+        await session.abortTransaction();
+        return { stale: true };
+      }
     }
-  );
-};
 
-const markSummaryFailed = async (encounterId, version, errorMessage) => {
-  await Encounter.updateOne(
-    { encounterId, version },
-    {
-      $set: {
-        'latestSummaryData.status': 'FAILED',
-        'latestSummaryData.errorMessage': errorMessage,
-      },
+    await createSummaryJob(
+      { encounterId, version, patientId, encounterType, transcription },
+      session
+    );
+
+    await session.commitTransaction();
+    return { ok: true };
+  } catch (err) {
+    await session.abortTransaction();
+    if (err.code === 11000) {
+      return { duplicate: true };
     }
-  );
-};
-
-const markSlaBreached = async (encounterId, version) => {
-  await Encounter.updateOne(
-    { encounterId, version, 'latestSummaryData.slaBreached': { $ne: true } },
-    {
-      $set: {
-        'latestSummaryData.slaBreached': true,
-        'latestSummaryData.slaBreachedAt': new Date(),
-      },
-    }
-  );
-};
-
-const sleepWithSlaTracking = async (encounterId, version, durationMs) => {
-  const slaTimer =
-    durationMs >= SLA_MS
-      ? setTimeout(async () => {
-          if (!(await isStaleJob(encounterId, version))) {
-            await markSlaBreached(encounterId, version);
-          }
-        }, SLA_MS)
-      : null;
-
-  await sleep(durationMs);
-
-  if (slaTimer) {
-    clearTimeout(slaTimer);
+    throw err;
+  } finally {
+    session.endSession();
   }
 };
 
@@ -167,29 +136,22 @@ const processEncounter = async (eventData) => {
       return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
     }
 
-    const processed = await recordProcessedEvent({
+    const result = await commitAcceptedEvent({
       eventId,
       encounterId,
       version,
       patientId,
       encounterType,
+      transcription: payload.transcription,
+      isNewEncounter: false,
     });
-    if (processed.duplicate) {
+
+    if (result.duplicate) {
       return { status: 200, code: 'DUPLICATE', message: 'Duplicate event ignored' };
     }
-
-    await Encounter.updateOne(
-      { encounterId },
-      {
-        $set: {
-          version,
-          transcription: payload.transcription,
-          latestSummaryData: buildPendingSummaryData(),
-        },
-      }
-    );
-
-    generateSummaryText(payload, encounterId, version, patientId, encounterType);
+    if (result.stale) {
+      return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
+    }
 
     return {
       status: 201,
@@ -201,29 +163,19 @@ const processEncounter = async (eventData) => {
 
   const generatedEncounterId = new mongoose.Types.ObjectId().toString();
 
-  const processed = await recordProcessedEvent({
+  const result = await commitAcceptedEvent({
     eventId,
     encounterId: generatedEncounterId,
     version,
     patientId,
     encounterType,
+    transcription: payload.transcription,
+    isNewEncounter: true,
   });
-  if (processed.duplicate) {
+
+  if (result.duplicate) {
     return { status: 200, code: 'DUPLICATE', message: 'Duplicate event ignored' };
   }
-
-  const encounter = new Encounter({
-    eventId,
-    encounterId: generatedEncounterId,
-    patientId,
-    encounterType,
-    version,
-    transcription: payload.transcription,
-    latestSummaryData: buildPendingSummaryData(),
-  });
-  await encounter.save();
-
-  generateSummaryText(payload, generatedEncounterId, version, patientId, encounterType);
 
   return {
     status: 201,
@@ -272,79 +224,6 @@ const getSummaryHistory = async (patientId, encounterType, encounterId) => {
     message: 'Summary history fetched successfully',
     data: summaryHistoryData,
   };
-};
-
-/**
- * Generate summary text from payload
- */
-const generateSummaryText = async (payload, encounterId, version, patientId, encounterType, retryCount = 0) => {
-  try {
-    if (await isStaleJob(encounterId, version)) {
-      return;
-    }
-
-    let timeout = Math.floor(Math.random() * 10000) + 5000;
-    const simulatedTimeout = timeout > SLA_MS;
-
-    if (simulatedTimeout) {
-      timeout = SLA_MS;
-    }
-
-    await sleepWithSlaTracking(encounterId, version, timeout);
-
-    if (await isStaleJob(encounterId, version)) {
-      return;
-    }
-
-    if (simulatedTimeout) {
-      const errorMessage = 'Timeout generating summary text';
-      await upsertSummaryHistory({
-        encounterId,
-        version,
-        patientId,
-        encounterType,
-        summaryText: null,
-        errorMessage,
-        retryCount,
-      });
-
-      if (retryCount >= MAX_RETRIES) {
-        await markSummaryFailed(encounterId, version, errorMessage);
-        return;
-      }
-
-      await sleep(RETRY_BACKOFF_MS[retryCount] ?? 8000);
-      return generateSummaryText(payload, encounterId, version, patientId, encounterType, retryCount + 1);
-    }
-
-    const summaryText = `Summary text of the payload whose length is ${payload?.transcription?.length}`;
-
-    if (await isStaleJob(encounterId, version)) {
-      await upsertSummaryHistory({
-        encounterId,
-        version,
-        patientId,
-        encounterType,
-        summaryText,
-        errorMessage: null,
-        retryCount,
-      });
-      return;
-    }
-
-    await markSummaryCompleted(encounterId, version, summaryText);
-    await upsertSummaryHistory({
-      encounterId,
-      version,
-      patientId,
-      encounterType,
-      summaryText,
-      errorMessage: null,
-      retryCount,
-    });
-  } catch (error) {
-    console.error('Error generating summary text:', error);
-  }
 };
 
 module.exports = {
