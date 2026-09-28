@@ -10,7 +10,7 @@ Node.js service that accepts clinical encounter updates, keeps the latest versio
 
 ## Run
 
-MongoDB must be running locally (default database `Outcomes`).
+MongoDB must be running locally (default database `Outcomes`). Ingest uses a multi-document transaction, so MongoDB must run as a **replica set** (a standalone `mongod` without `--replSet` will reject transactions).
 
 ```bash
 cp .env.example .env
@@ -61,6 +61,8 @@ The handler returns `201` before the summary is ready. Poll the summary route.
 `201` and `200` bodies look like `{ "status", "code", "message", "data": { "encounterId", "version" } }`. `data` is only present on `ACCEPTED`. On a brand-new visit, `data.encounterId` is the id the server generated for that visit.
 
 Every accepted event is recorded in `ProcessedEvent` with a unique `eventId` and a unique `(encounterId, version)` pair. Retries of the same `eventId`, or a second event for the same version under a different `eventId`, return `DUPLICATE`.
+
+Acceptance writes `ProcessedEvent`, `Encounter`, and `SummaryJob` in a single MongoDB transaction — either all three succeed or none are persisted.
 
 `encounterType` is required, and it is stored on create. A later event for the same `encounterId` must send that same type. A different type is rejected with `422`, the same way a different `patientId` is.
 
@@ -150,7 +152,6 @@ Errors thrown from the service go through the handler in `src/app.js` and return
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.
-- MongoDB transaction wrapping ingest (ProcessedEvent + Encounter + SummaryJob) for full atomicity.
 - Tests for duplicate, stale, out-of-order, concurrent, and crash/retry cases (Phase 3).
 - Design submission document (Phase 4).
 

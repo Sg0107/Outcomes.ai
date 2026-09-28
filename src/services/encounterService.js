@@ -14,15 +14,77 @@ const buildPendingSummaryData = () => ({
   slaBreachedAt: null,
 });
 
-const recordProcessedEvent = async ({ eventId, encounterId, version, patientId, encounterType }) => {
+/**
+ * Atomically record ProcessedEvent, update/create Encounter, and queue SummaryJob.
+ */
+const commitAcceptedEvent = async ({
+  eventId,
+  encounterId,
+  version,
+  patientId,
+  encounterType,
+  transcription,
+  isNewEncounter,
+}) => {
+  const session = await mongoose.startSession();
+
   try {
-    await ProcessedEvent.create({ eventId, encounterId, version, patientId, encounterType });
-    return { duplicate: false };
+    session.startTransaction();
+
+    await ProcessedEvent.create(
+      [{ eventId, encounterId, version, patientId, encounterType }],
+      { session }
+    );
+
+    if (isNewEncounter) {
+      await Encounter.create(
+        [
+          {
+            eventId,
+            encounterId,
+            patientId,
+            encounterType,
+            version,
+            transcription,
+            latestSummaryData: buildPendingSummaryData(),
+          },
+        ],
+        { session }
+      );
+    } else {
+      const updateResult = await Encounter.updateOne(
+        { encounterId, version: { $lt: version } },
+        {
+          $set: {
+            version,
+            transcription,
+            latestSummaryData: buildPendingSummaryData(),
+          },
+        },
+        { session }
+      );
+
+      if (updateResult.modifiedCount === 0) {
+        await session.abortTransaction();
+        return { stale: true };
+      }
+    }
+
+    await createSummaryJob(
+      { encounterId, version, patientId, encounterType, transcription },
+      session
+    );
+
+    await session.commitTransaction();
+    return { ok: true };
   } catch (err) {
+    await session.abortTransaction();
     if (err.code === 11000) {
       return { duplicate: true };
     }
     throw err;
+  } finally {
+    session.endSession();
   }
 };
 
@@ -74,35 +136,22 @@ const processEncounter = async (eventData) => {
       return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
     }
 
-    const processed = await recordProcessedEvent({
+    const result = await commitAcceptedEvent({
       eventId,
       encounterId,
       version,
       patientId,
       encounterType,
+      transcription: payload.transcription,
+      isNewEncounter: false,
     });
-    if (processed.duplicate) {
+
+    if (result.duplicate) {
       return { status: 200, code: 'DUPLICATE', message: 'Duplicate event ignored' };
     }
-
-    await Encounter.updateOne(
-      { encounterId },
-      {
-        $set: {
-          version,
-          transcription: payload.transcription,
-          latestSummaryData: buildPendingSummaryData(),
-        },
-      }
-    );
-
-    await createSummaryJob({
-      encounterId,
-      version,
-      patientId,
-      encounterType,
-      transcription: payload.transcription,
-    });
+    if (result.stale) {
+      return { status: 200, code: 'STALE_IGNORED', message: 'Stale version ignored' };
+    }
 
     return {
       status: 201,
@@ -114,35 +163,19 @@ const processEncounter = async (eventData) => {
 
   const generatedEncounterId = new mongoose.Types.ObjectId().toString();
 
-  const processed = await recordProcessedEvent({
+  const result = await commitAcceptedEvent({
     eventId,
     encounterId: generatedEncounterId,
     version,
     patientId,
     encounterType,
+    transcription: payload.transcription,
+    isNewEncounter: true,
   });
-  if (processed.duplicate) {
+
+  if (result.duplicate) {
     return { status: 200, code: 'DUPLICATE', message: 'Duplicate event ignored' };
   }
-
-  const encounter = new Encounter({
-    eventId,
-    encounterId: generatedEncounterId,
-    patientId,
-    encounterType,
-    version,
-    transcription: payload.transcription,
-    latestSummaryData: buildPendingSummaryData(),
-  });
-  await encounter.save();
-
-  await createSummaryJob({
-    encounterId: generatedEncounterId,
-    version,
-    patientId,
-    encounterType,
-    transcription: payload.transcription,
-  });
 
   return {
     status: 201,
