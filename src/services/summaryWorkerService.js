@@ -240,17 +240,26 @@ const processSummaryJob = async (job) => {
   }
 };
 
-const createSummaryJob = async ({ encounterId, version, patientId, encounterType, transcription }) => {
-  await SummaryJob.create({
-    encounterId,
-    version,
-    patientId,
-    encounterType,
-    transcription,
-    status: 'PENDING',
-    attempts: 0,
-    nextRetryAt: new Date(),
-  });
+const createSummaryJob = async (
+  { encounterId, version, patientId, encounterType, transcription },
+  session = null
+) => {
+  const options = session ? { session } : {};
+  await SummaryJob.create(
+    [
+      {
+        encounterId,
+        version,
+        patientId,
+        encounterType,
+        transcription,
+        status: 'PENDING',
+        attempts: 0,
+        nextRetryAt: new Date(),
+      },
+    ],
+    options
+  );
 };
 
 const pollAndProcessJobs = async () => {
