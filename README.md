@@ -163,10 +163,13 @@ npm test
 
 Covers: happy path, duplicate, stale/out-of-order, concurrent duplicate, crash recovery, version guard, and retry exhaustion.
 
+## Design document
+
+See [`DESIGN.md`](DESIGN.md) for the full submission write-up: API contract, data model, failure scenario walkthroughs, observability, test plan, and tradeoffs.
+
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.
-- Design submission document (Phase 4).
 
 ## Credits
 
