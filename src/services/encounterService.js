@@ -2,7 +2,7 @@ const Encounter = require('../models/Encounter');
 const ProcessedEvent = require('../models/ProcessedEvent');
 const SummaryHistory = require('../models/summaryHistory');
 const mongoose = require('mongoose');
-const { MAX_RETRIES, SLA_MS, RETRY_BACKOFF_MS } = require('../helper/constants');
+const { createSummaryJob } = require('./summaryWorkerService');
 
 const buildPendingSummaryData = () => ({
   status: 'PENDING',
@@ -14,8 +14,6 @@ const buildPendingSummaryData = () => ({
   slaBreachedAt: null,
 });
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 const recordProcessedEvent = async ({ eventId, encounterId, version, patientId, encounterType }) => {
   try {
     await ProcessedEvent.create({ eventId, encounterId, version, patientId, encounterType });
@@ -25,97 +23,6 @@ const recordProcessedEvent = async ({ eventId, encounterId, version, patientId, 
       return { duplicate: true };
     }
     throw err;
-  }
-};
-
-const getEncounterVersion = async (encounterId) => {
-  const encounter = await Encounter.findOne({ encounterId }).select('version').lean();
-  return encounter?.version ?? null;
-};
-
-const isStaleJob = async (encounterId, version) => {
-  const currentVersion = await getEncounterVersion(encounterId);
-  return currentVersion === null || currentVersion > version;
-};
-
-const upsertSummaryHistory = async ({
-  encounterId,
-  version,
-  patientId,
-  encounterType,
-  summaryText,
-  errorMessage,
-  retryCount,
-}) => {
-  await SummaryHistory.updateOne(
-    { encounterId, version },
-    {
-      $set: {
-        patientId,
-        encounterType,
-        summaryText,
-        errorMessage,
-        retryCount,
-        completedAt: new Date(),
-      },
-      $setOnInsert: { queuedAt: new Date() },
-    },
-    { upsert: true }
-  );
-};
-
-const markSummaryCompleted = async (encounterId, version, summaryText) => {
-  await Encounter.updateOne(
-    { encounterId, version },
-    {
-      $set: {
-        'latestSummaryData.summaryText': summaryText,
-        'latestSummaryData.status': 'COMPLETED',
-        'latestSummaryData.errorMessage': null,
-        'latestSummaryData.completedAt': new Date(),
-      },
-    }
-  );
-};
-
-const markSummaryFailed = async (encounterId, version, errorMessage) => {
-  await Encounter.updateOne(
-    { encounterId, version },
-    {
-      $set: {
-        'latestSummaryData.status': 'FAILED',
-        'latestSummaryData.errorMessage': errorMessage,
-      },
-    }
-  );
-};
-
-const markSlaBreached = async (encounterId, version) => {
-  await Encounter.updateOne(
-    { encounterId, version, 'latestSummaryData.slaBreached': { $ne: true } },
-    {
-      $set: {
-        'latestSummaryData.slaBreached': true,
-        'latestSummaryData.slaBreachedAt': new Date(),
-      },
-    }
-  );
-};
-
-const sleepWithSlaTracking = async (encounterId, version, durationMs) => {
-  const slaTimer =
-    durationMs >= SLA_MS
-      ? setTimeout(async () => {
-          if (!(await isStaleJob(encounterId, version))) {
-            await markSlaBreached(encounterId, version);
-          }
-        }, SLA_MS)
-      : null;
-
-  await sleep(durationMs);
-
-  if (slaTimer) {
-    clearTimeout(slaTimer);
   }
 };
 
@@ -189,7 +96,13 @@ const processEncounter = async (eventData) => {
       }
     );
 
-    generateSummaryText(payload, encounterId, version, patientId, encounterType);
+    await createSummaryJob({
+      encounterId,
+      version,
+      patientId,
+      encounterType,
+      transcription: payload.transcription,
+    });
 
     return {
       status: 201,
@@ -223,7 +136,13 @@ const processEncounter = async (eventData) => {
   });
   await encounter.save();
 
-  generateSummaryText(payload, generatedEncounterId, version, patientId, encounterType);
+  await createSummaryJob({
+    encounterId: generatedEncounterId,
+    version,
+    patientId,
+    encounterType,
+    transcription: payload.transcription,
+  });
 
   return {
     status: 201,
@@ -272,79 +191,6 @@ const getSummaryHistory = async (patientId, encounterType, encounterId) => {
     message: 'Summary history fetched successfully',
     data: summaryHistoryData,
   };
-};
-
-/**
- * Generate summary text from payload
- */
-const generateSummaryText = async (payload, encounterId, version, patientId, encounterType, retryCount = 0) => {
-  try {
-    if (await isStaleJob(encounterId, version)) {
-      return;
-    }
-
-    let timeout = Math.floor(Math.random() * 10000) + 5000;
-    const simulatedTimeout = timeout > SLA_MS;
-
-    if (simulatedTimeout) {
-      timeout = SLA_MS;
-    }
-
-    await sleepWithSlaTracking(encounterId, version, timeout);
-
-    if (await isStaleJob(encounterId, version)) {
-      return;
-    }
-
-    if (simulatedTimeout) {
-      const errorMessage = 'Timeout generating summary text';
-      await upsertSummaryHistory({
-        encounterId,
-        version,
-        patientId,
-        encounterType,
-        summaryText: null,
-        errorMessage,
-        retryCount,
-      });
-
-      if (retryCount >= MAX_RETRIES) {
-        await markSummaryFailed(encounterId, version, errorMessage);
-        return;
-      }
-
-      await sleep(RETRY_BACKOFF_MS[retryCount] ?? 8000);
-      return generateSummaryText(payload, encounterId, version, patientId, encounterType, retryCount + 1);
-    }
-
-    const summaryText = `Summary text of the payload whose length is ${payload?.transcription?.length}`;
-
-    if (await isStaleJob(encounterId, version)) {
-      await upsertSummaryHistory({
-        encounterId,
-        version,
-        patientId,
-        encounterType,
-        summaryText,
-        errorMessage: null,
-        retryCount,
-      });
-      return;
-    }
-
-    await markSummaryCompleted(encounterId, version, summaryText);
-    await upsertSummaryHistory({
-      encounterId,
-      version,
-      patientId,
-      encounterType,
-      summaryText,
-      errorMessage: null,
-      retryCount,
-    });
-  } catch (error) {
-    console.error('Error generating summary text:', error);
-  }
 };
 
 module.exports = {

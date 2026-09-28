@@ -49,8 +49,8 @@ The handler returns `201` before the summary is ready. Poll the summary route.
 
 | Outcome | HTTP | `code` | What happens |
 | --- | --- | --- | --- |
-| New visit (`encounterId` omitted) | 201 | `ACCEPTED` | A document is created with a generated `encounterId`, the transcription, and a `PENDING` summary. Summary generation starts immediately. |
-| Newer version of an existing visit | 201 | `ACCEPTED` | `version` and `transcription` move forward. `latestSummaryData` resets to `PENDING`. A new summary run starts for the new version. |
+| New visit (`encounterId` omitted) | 201 | `ACCEPTED` | A document is created with a generated `encounterId`, the transcription, and a `PENDING` summary. A `SummaryJob` is queued for the background worker. |
+| Newer version of an existing visit | 201 | `ACCEPTED` | `version` and `transcription` move forward. `latestSummaryData` resets to `PENDING`. A new `SummaryJob` is queued. Older jobs keep running their retry cycle independently. |
 | Same `eventId` as a previously accepted event | 200 | `DUPLICATE` | Nothing is written. |
 | Same `(encounterId, version)` under a different `eventId` | 200 | `DUPLICATE` | Nothing is written. |
 | `encounterId` that does not exist | 404 | `NOT_FOUND` | Nothing is written. |
@@ -70,18 +70,22 @@ Every accepted event is recorded in `ProcessedEvent` with a unique `eventId` and
 
 On success, returns `{ "data": { "status", "summaryText", "errorMessage", "queuedAt", "completedAt", "slaBreached", "slaBreachedAt" } }`.
 
-Generation picks a delay from 5 seconds up to just under 15 seconds. The run is not awaited by the ingest handler, and it is not resumed after a process restart. A visit left in `PENDING` stays there.
+Summary generation is handled by a background polling worker (`src/worker/summaryWorker.js`), not inline in the ingest handler. On accept, a persistent `SummaryJob` is created with an immutable `transcription` snapshot. The worker polls every 2 seconds, atomically claims `PENDING` jobs, and calls a mock `generate_summary`.
+
+On server restart, stuck `PROCESSING` jobs (older than 2 minutes) are reset to `PENDING` and picked up again.
 
 If the simulated delay exceeds 10 seconds, the run waits 10 seconds, sets `slaBreached` to `true`, records the timeout in history, and retries up to 3 times with backoff (2s, 4s, 8s). The visit stays `PENDING` during retries. After all retries are exhausted, `status` becomes `FAILED`. Updates always match `encounterId` and this run’s `version`, so a newer version already stored on the visit is left alone.
 
-Otherwise the run waits the full delay, then builds `summaryText` as `Summary text of the payload whose length is <n>` and reads the visit’s stored `version`.
+Otherwise the run waits the full delay, then builds `summaryText` as `Summary text of the payload whose length is <n>` using the job’s frozen transcription — never the live encounter document.
 
 | Stored version | What is written |
 | --- | --- |
-| Newer than this run | The text is saved to summary history only. `latestSummaryData` on the visit is not touched — the newer version keeps its current status. |
+| Newer than this run | Result saved to `SummaryHistory` only. `Encounter.latestSummaryData` is not touched — version guard prevents older results becoming current. |
 | Still this run’s version | `summaryText`, `status` `COMPLETED`, and `completedAt` are written on the visit, and a history row is inserted. |
 
-The status enum is `PENDING`, `COMPLETED`, `FAILED`, `SUPERSEDED`. A successful run writes `COMPLETED`. A timeout writes `FAILED`.
+Jobs always run their full retry cycle (up to 3 retries) regardless of newer versions arriving. Whether to cancel obsolete work early is a product trade-off; this implementation allows jobs to complete.
+
+The status enum is `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`. A successful run writes `COMPLETED`. Exhausted retries write `FAILED`.
 
 If the visit does not exist, the route returns `404` with `{ "error": { "message": "Encounter not found" } }`.
 
@@ -117,20 +121,26 @@ No rows returns HTTP `404` with `code` `NOT_FOUND`.
 
 `ProcessedEvent` — one document per accepted event. Fields: `eventId`, `encounterId`, `version`, `patientId`, `encounterType`. Unique index on `eventId` and on `(encounterId, version)`.
 
+`SummaryJob` — one persistent job per `(encounterId, version)`. Fields: `transcription` (immutable snapshot), `status`, `attempts`, `nextRetryAt`, `summaryText`, `errorMessage`, `slaBreached`, `slaBreachedAt`, timestamps. Unique index on `(encounterId, version)`; poll index on `(status, nextRetryAt)`.
+
 `SummaryHistory` — one document per summary run, including a timeout. Fields: `patientId`, `encounterType`, `encounterId`, `version`, `summaryText`, `errorMessage`, `queuedAt`, `completedAt`, `retryCount`. `summaryText` is null when the run times out. Unique index on `(encounterId, version)`.
 
 ## Layout
 
 ```
-server.js                          connect Mongo, then listen
+server.js                          connect Mongo, start worker, listen
 src/app.js                         Express app, health check, /v1 routes, tester page, error JSON
 src/config/env.js                  PORT, MONGO_URI, NODE_ENV
 src/config/db.js                   mongoose.connect
+src/worker/summaryWorker.js        polling worker loop
+src/services/summaryWorkerService.js  claim, process, retry, SLA, crash recovery
 src/routes/encounterRoutes.js      ingest, summary, summary history
 src/controllers/encounterController.js
-src/services/encounterService.js   idempotency, stale check, patient mismatch, summary generation
+src/services/encounterService.js   ingest, idempotency, stale check
+src/helper/constants.js            retry, SLA, worker poll intervals
 src/models/Encounter.js
 src/models/ProcessedEvent.js
+src/models/SummaryJob.js
 src/models/summaryHistory.js
 public/index.html                  local page for exercising the API
 ```
@@ -140,9 +150,7 @@ Errors thrown from the service go through the handler in `src/app.js` and return
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.
-- Pickup of `PENDING` jobs after a process restart (Phase 2).
-- Persistent `SummaryJob` queue and background worker (Phase 2).
-- SLA breach as operational signal separate from failure (Phase 2).
+- MongoDB transaction wrapping ingest (ProcessedEvent + Encounter + SummaryJob) for full atomicity.
 - Tests for duplicate, stale, out-of-order, concurrent, and crash/retry cases (Phase 3).
 - Design submission document (Phase 4).
 
