@@ -153,10 +153,19 @@ Errors thrown from the service go through the handler in `src/app.js` and return
 
 Structured JSON logs via `src/helper/logger.js`. Each line includes `component`, `message`, and metadata such as `eventId`, `encounterId`, `version`, `jobId`, `attempt`, `durationMs`, and `slaBreached`. Transcription text and summary content are never logged.
 
+## Tests
+
+Requires a replica set for ingest transactions in dev; tests use an in-memory replica set automatically.
+
+```bash
+npm test
+```
+
+Covers: happy path, duplicate, stale/out-of-order, concurrent duplicate, crash recovery, version guard, and retry exhaustion.
+
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.
-- Tests for duplicate, stale, out-of-order, concurrent, and crash/retry cases (Phase 3).
 - Design submission document (Phase 4).
 
 ## Credits

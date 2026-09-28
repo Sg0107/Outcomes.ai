@@ -11,6 +11,22 @@ const {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** @test-only Replace generate_summary in tests for deterministic behavior */
+let testGenerateSummaryImpl = null;
+const setTestGenerateSummaryImpl = (impl) => {
+  testGenerateSummaryImpl = impl;
+};
+const resetTestGenerateSummaryImpl = () => {
+  testGenerateSummaryImpl = null;
+};
+
+const runGenerateSummary = async (transcription, encounterId, version) => {
+  if (testGenerateSummaryImpl) {
+    return testGenerateSummaryImpl(transcription, encounterId, version);
+  }
+  return generateSummary(transcription, encounterId, version);
+};
+
 const jobMeta = (job) => ({
   jobId: job._id?.toString(),
   encounterId: job.encounterId,
@@ -277,7 +293,7 @@ const processSummaryJob = async (job) => {
   logger.info('worker.process', 'Job processing started', jobMeta(job));
 
   try {
-    const result = await generateSummary(job.transcription, job.encounterId, job.version);
+    const result = await runGenerateSummary(job.transcription, job.encounterId, job.version);
 
     if (!result.success) {
       await scheduleRetry(job, result.errorMessage);
@@ -350,4 +366,7 @@ module.exports = {
   recoverStuckJobs,
   pollAndProcessJobs,
   createSummaryJob,
+  processSummaryJob,
+  setTestGenerateSummaryImpl,
+  resetTestGenerateSummaryImpl,
 };

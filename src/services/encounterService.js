@@ -15,10 +15,12 @@ const buildPendingSummaryData = () => ({
   slaBreachedAt: null,
 });
 
-/**
- * Atomically record ProcessedEvent, update/create Encounter, and queue SummaryJob.
- */
-const commitAcceptedEvent = async ({
+const isTransientTransactionError = (err) =>
+  err?.errorLabels?.includes('TransientTransactionError') ||
+  err?.message?.includes('Please retry your operation') ||
+  err?.message?.includes('catalog changes');
+
+const runAcceptanceTransaction = async ({
   eventId,
   encounterId,
   version,
@@ -93,14 +95,41 @@ const commitAcceptedEvent = async ({
       logger.warn('ingest.transaction', 'Transaction aborted — duplicate key', { ...txnMeta, errorCode: err.code });
       return { duplicate: true };
     }
-    logger.error('ingest.transaction', 'Transaction aborted — unexpected error', {
-      ...txnMeta,
-      errorMessage: err.message,
-    });
     throw err;
   } finally {
     session.endSession();
   }
+};
+
+/**
+ * Atomically record ProcessedEvent, update/create Encounter, and queue SummaryJob.
+ */
+const commitAcceptedEvent = async (params) => {
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await runAcceptanceTransaction(params);
+    } catch (err) {
+      if (isTransientTransactionError(err) && attempt < maxAttempts) {
+        logger.warn('ingest.transaction', 'Transient transaction error — retrying', {
+          eventId: params.eventId,
+          encounterId: params.encounterId,
+          attempt,
+          errorMessage: err.message,
+        });
+        continue;
+      }
+      logger.error('ingest.transaction', 'Transaction aborted — unexpected error', {
+        eventId: params.eventId,
+        encounterId: params.encounterId,
+        errorMessage: err.message,
+      });
+      throw err;
+    }
+  }
+
+  return { duplicate: true };
 };
 
 /**
