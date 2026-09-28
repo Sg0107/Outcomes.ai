@@ -1,4 +1,5 @@
 const { WORKER_POLL_INTERVAL_MS } = require('../helper/constants');
+const logger = require('../helper/logger');
 const { recoverStuckJobs, pollAndProcessJobs } = require('../services/summaryWorkerService');
 
 let pollTimer = null;
@@ -10,23 +11,25 @@ const tick = async () => {
   try {
     await pollAndProcessJobs();
   } catch (error) {
-    console.error('Summary worker poll error:', error.message);
+    logger.error('worker.poll', 'Poll cycle error', { errorMessage: error.message });
   } finally {
     isPolling = false;
   }
 };
 
 const startSummaryWorker = async () => {
+  logger.info('worker', 'Summary worker starting', { pollIntervalMs: WORKER_POLL_INTERVAL_MS });
   await recoverStuckJobs();
   await tick();
   pollTimer = setInterval(tick, WORKER_POLL_INTERVAL_MS);
-  console.log(`Summary worker started (poll every ${WORKER_POLL_INTERVAL_MS}ms)`);
+  logger.info('worker', 'Summary worker started', { pollIntervalMs: WORKER_POLL_INTERVAL_MS });
 };
 
 const stopSummaryWorker = () => {
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
+    logger.info('worker', 'Summary worker stopped');
   }
 };
 

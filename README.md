@@ -149,6 +149,10 @@ public/index.html                  local page for exercising the API
 
 Errors thrown from the service go through the handler in `src/app.js` and return `{ "error": { "message" } }`. Ingest outcomes that return a `code` are sent directly by the controller.
 
+## Logging
+
+Structured JSON logs via `src/helper/logger.js`. Each line includes `component`, `message`, and metadata such as `eventId`, `encounterId`, `version`, `jobId`, `attempt`, `durationMs`, and `slaBreached`. Transcription text and summary content are never logged.
+
 ## Still open
 
 - Request body from the assignment brief (`event_id`, snake_case fields). The API is camelCase, with transcription under `payload`.

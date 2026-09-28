@@ -1,6 +1,7 @@
 const Encounter = require('../models/Encounter');
 const SummaryJob = require('../models/SummaryJob');
 const SummaryHistory = require('../models/summaryHistory');
+const logger = require('../helper/logger');
 const {
   MAX_RETRIES,
   SLA_MS,
@@ -9,6 +10,13 @@ const {
 } = require('../helper/constants');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const jobMeta = (job) => ({
+  jobId: job._id?.toString(),
+  encounterId: job.encounterId,
+  version: job.version,
+  attempt: job.attempts,
+});
 
 const getEncounterVersion = async (encounterId) => {
   const encounter = await Encounter.findOne({ encounterId }).select('version').lean();
@@ -90,6 +98,7 @@ const markEncounterSlaBreached = async (encounterId, version) => {
  */
 const finalizeJob = async (job, { status, summaryText = null, errorMessage = null }) => {
   const retryCount = Math.max(0, job.attempts - 1);
+  const current = await isCurrentVersion(job.encounterId, job.version);
 
   await SummaryJob.updateOne(
     { _id: job._id },
@@ -114,12 +123,23 @@ const finalizeJob = async (job, { status, summaryText = null, errorMessage = nul
     retryCount,
   });
 
-  if (await isCurrentVersion(job.encounterId, job.version)) {
+  if (current) {
     if (status === 'COMPLETED') {
       await markEncounterSummaryCompleted(job.encounterId, job.version, summaryText);
     } else if (status === 'FAILED') {
       await markEncounterSummaryFailed(job.encounterId, job.version, errorMessage);
     }
+    logger.info('worker.finalize', 'Job finalized — encounter updated', {
+      ...jobMeta(job),
+      status,
+      encounterUpdated: true,
+    });
+  } else {
+    logger.info('worker.finalize', 'Job finalized — history only (not current version)', {
+      ...jobMeta(job),
+      status,
+      encounterUpdated: false,
+    });
   }
 };
 
@@ -133,6 +153,7 @@ const sleepWithSlaTracking = async (encounterId, version, durationMs) => {
               { encounterId, version, slaBreached: { $ne: true } },
               { $set: { slaBreached: true, slaBreachedAt: new Date() } }
             );
+            logger.warn('worker.sla', 'SLA breached', { encounterId, version, slaMs: SLA_MS });
           }
         }, SLA_MS)
       : null;
@@ -148,6 +169,7 @@ const sleepWithSlaTracking = async (encounterId, version, durationMs) => {
  * Mock generate_summary — uses immutable transcription from the job snapshot.
  */
 const generateSummary = async (transcription, encounterId, version) => {
+  const startMs = Date.now();
   let delay = Math.floor(Math.random() * 10000) + 5000;
   const timedOut = delay > SLA_MS;
 
@@ -155,15 +177,26 @@ const generateSummary = async (transcription, encounterId, version) => {
     delay = SLA_MS;
   }
 
+  logger.info('worker.generate', 'Summary generation started', {
+    encounterId,
+    version,
+    simulatedDelayMs: delay,
+  });
+
   await sleepWithSlaTracking(encounterId, version, delay);
 
+  const durationMs = Date.now() - startMs;
+
   if (timedOut) {
-    return { success: false, errorMessage: 'Timeout generating summary text' };
+    logger.warn('worker.generate', 'Summary generation timed out', { encounterId, version, durationMs });
+    return { success: false, errorMessage: 'Timeout generating summary text', durationMs };
   }
 
+  logger.info('worker.generate', 'Summary generation completed', { encounterId, version, durationMs });
   return {
     success: true,
     summaryText: `Summary text of the payload whose length is ${transcription?.length ?? 0}`,
+    durationMs,
   };
 };
 
@@ -174,17 +207,26 @@ const recoverStuckJobs = async () => {
     { $set: { status: 'PENDING', startedAt: null } }
   );
   if (result.modifiedCount > 0) {
-    console.log(`Recovered ${result.modifiedCount} stuck summary job(s)`);
+    logger.warn('worker.recovery', 'Stuck jobs recovered', {
+      count: result.modifiedCount,
+      thresholdMs: STUCK_JOB_THRESHOLD_MS,
+    });
   }
 };
 
 const claimPendingJob = async () => {
   const now = new Date();
-  return SummaryJob.findOneAndUpdate(
+  const job = await SummaryJob.findOneAndUpdate(
     { status: 'PENDING', nextRetryAt: { $lte: now } },
     { $set: { status: 'PROCESSING', startedAt: now }, $inc: { attempts: 1 } },
     { sort: { nextRetryAt: 1, queuedAt: 1 }, new: true }
   );
+
+  if (job) {
+    logger.info('worker.claim', 'Job claimed', jobMeta(job));
+  }
+
+  return job;
 };
 
 const scheduleRetry = async (job, errorMessage) => {
@@ -201,6 +243,11 @@ const scheduleRetry = async (job, errorMessage) => {
   });
 
   if (job.attempts > MAX_RETRIES) {
+    logger.error('worker.retry', 'Max retries exhausted — job failed', {
+      ...jobMeta(job),
+      maxRetries: MAX_RETRIES,
+      errorMessage,
+    });
     await finalizeJob(job, { status: 'FAILED', errorMessage });
     return;
   }
@@ -217,9 +264,18 @@ const scheduleRetry = async (job, errorMessage) => {
       },
     }
   );
+
+  logger.info('worker.retry', 'Retry scheduled', {
+    ...jobMeta(job),
+    backoffMs: backoff,
+    errorMessage,
+  });
 };
 
 const processSummaryJob = async (job) => {
+  const startMs = Date.now();
+  logger.info('worker.process', 'Job processing started', jobMeta(job));
+
   try {
     const result = await generateSummary(job.transcription, job.encounterId, job.version);
 
@@ -229,12 +285,17 @@ const processSummaryJob = async (job) => {
     }
 
     await finalizeJob(job, { status: 'COMPLETED', summaryText: result.summaryText });
+
+    logger.info('worker.process', 'Job processing finished', {
+      ...jobMeta(job),
+      outcome: 'COMPLETED',
+      durationMs: Date.now() - startMs,
+    });
   } catch (error) {
-    console.error('Error processing summary job:', {
-      jobId: job._id,
-      encounterId: job.encounterId,
-      version: job.version,
-      error: error.message,
+    logger.error('worker.process', 'Job processing error', {
+      ...jobMeta(job),
+      errorMessage: error.message,
+      durationMs: Date.now() - startMs,
     });
     await scheduleRetry(job, error.message || 'Error generating summary text');
   }
@@ -245,7 +306,7 @@ const createSummaryJob = async (
   session = null
 ) => {
   const options = session ? { session } : {};
-  await SummaryJob.create(
+  const [job] = await SummaryJob.create(
     [
       {
         encounterId,
@@ -260,13 +321,28 @@ const createSummaryJob = async (
     ],
     options
   );
+
+  if (!session) {
+    logger.info('worker.queue', 'SummaryJob created', {
+      jobId: job._id.toString(),
+      encounterId,
+      version,
+    });
+  }
 };
 
 const pollAndProcessJobs = async () => {
   let job = await claimPendingJob();
+  let processedCount = 0;
+
   while (job) {
     await processSummaryJob(job);
+    processedCount += 1;
     job = await claimPendingJob();
+  }
+
+  if (processedCount > 0) {
+    logger.info('worker.poll', 'Poll cycle completed', { jobsProcessed: processedCount });
   }
 };
 

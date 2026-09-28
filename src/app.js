@@ -1,6 +1,7 @@
 const path = require('path');
 const express = require('express');
 const encounterRoutes = require('./routes/encounterRoutes');
+const logger = require('./helper/logger');
 const app = express();
 
 // Middleware
@@ -21,7 +22,12 @@ app.get('/', (req, res) => {
 
 // Centralized Error Handler Middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  logger.error('api.error', 'Unhandled request error', {
+    httpStatus: err.status || 500,
+    errorMessage: err.message || 'Internal Server Error',
+    path: req.path,
+    method: req.method,
+  });
   res.status(err.status || 500).json({
     error: {
       message: err.message || 'Internal Server Error',
